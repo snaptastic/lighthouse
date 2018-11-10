@@ -1,30 +1,54 @@
-use std::io::prelude::*;
+extern crate snow;
+
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
-extern crate sodiumoxide;
-use sodiumoxide::crypto::box_;
+use snow::Builder;
 
 fn main() {
-    let init = sodiumoxide::init();
-    match init {
-        Ok(s) => s,
-        Err(_) => panic!("Failed to initialize"),
+    let mut buffer = vec![0u8; 65535];
+
+    let builder: Builder = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+    let static_key = builder.generate_keypair().unwrap().private;
+    let mut noise = builder
+        .local_private_key(&static_key)
+        .build_initiator().unwrap();
+    
+    // Connect to our server, which is hopefully listening.
+    let mut connection = TcpStream::connect("127.0.0.1:12345").unwrap();
+    println!("connected...");
+
+    // -> e
+    let len = noise.write_message(&[], &mut buffer).unwrap();
+    send(&mut connection, &buffer[..len]);
+    
+    // <- e, ee
+    noise.read_message(&recv(&mut connection).unwrap(), &mut buffer).unwrap();
+
+    let mut noise = noise.into_transport_mode().unwrap();
+    println!("Connection established...");
+
+    // Get to the important business of sending secured data.
+    for _ in 0..10 {
+        let len = noise.write_message(b"HACK THE PLANET", &mut buffer).unwrap();
+        send(&mut connection, &buffer[..len]);
     }
+    println!("notified server of intent to hack planet.");
     
-    let mut connection = TcpStream::connect("127.0.0.1:12345")
-                                   .expect("Error connecting");
-        
-    let (ourpk, oursk) = box_::gen_keypair();
-    let nonce = box_::gen_nonce();
-    let _ = connection.write(&ourpk.0);
-    
-    let plaintext = b"Test Message\n";
+}
 
-    let mut theirpk_bytes = [0; 32];
-    connection.read(&mut theirpk_bytes).unwrap();
+/// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
+fn recv(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut msg_len_buf = [0u8; 2];
+    stream.read_exact(&mut msg_len_buf)?;
+    let msg_len = ((msg_len_buf[0] as usize) << 8) + (msg_len_buf[1] as usize);
+    let mut msg = vec![0u8; msg_len];
+    stream.read_exact(&mut msg[..])?;
+    Ok(msg)
+}
 
-    let theirpk = box_::PublicKey(theirpk_bytes);
-    let ciphertext = box_::seal(plaintext, &nonce, &theirpk, &oursk);
-
-    let _ = connection.write(&ciphertext);
-
+/// Hyper-basic stream transport sender. 16-bit BE size followed by payload.
+fn send(stream: &mut TcpStream, buf: &[u8]) {
+    let msg_len_buf = [(buf.len() >> 8) as u8, (buf.len() & 0xff) as u8];
+    stream.write_all(&msg_len_buf).unwrap();
+    stream.write_all(buf).unwrap();
 }

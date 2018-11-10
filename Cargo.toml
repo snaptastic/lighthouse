@@ -12,4 +12,4 @@ name = "client"
 path = "src/client/bin/main.rs"
 
 [dependencies]
-sodiumoxide = "0.1.0"
+snow = "0.4.0"
