@@ -1,39 +1,48 @@
-extern crate snow;
+extern crate sodiumoxide;
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use snow::Builder;
+use sodiumoxide::crypto::kx;
 
 fn main() {
     let mut buffer = vec![0u8; 65535];
+    sodiumoxide::init();
 
-    let builder: Builder = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-    let static_key = builder.generate_keypair().unwrap().private;
-    let mut noise = builder
-        .local_private_key(&static_key)
-        .build_initiator().unwrap();
-    
+    let (client_pk, client_sk) = kx::gen_keypair();
+
     // Connect to our server, which is hopefully listening.
     let mut connection = TcpStream::connect("127.0.0.1:12345").unwrap();
     println!("connected...");
 
-    // -> e
-    let len = noise.write_message(&[], &mut buffer).unwrap();
-    send(&mut connection, &buffer[..len]);
-    
-    // <- e, ee
-    noise.read_message(&recv(&mut connection).unwrap(), &mut buffer).unwrap();
+    send(&mut connection, &client_pk.0);
+    println!("Sending key: {:?}", client_pk.0);
 
-    let mut noise = noise.into_transport_mode().unwrap();
-    println!("Connection established...");
 
-    // Get to the important business of sending secured data.
-    for _ in 0..10 {
-        let len = noise.write_message(b"HACK THE PLANET", &mut buffer).unwrap();
-        send(&mut connection, &buffer[..len]);
-    }
-    println!("notified server of intent to hack planet.");
     
+    let server_pk = match recv(&mut connection) {
+        Ok(v) => v,
+        Err(e) => {
+            panic!("Error receiving server key");
+        },
+    };
+
+    println!("Receiving server pk: {:?}", server_pk);
+    let server_pk = match sodiumoxide::crypto::kx::x25519blake2b::PublicKey::from_slice(&server_pk) {
+        Some(v) => v,
+        None => {
+            panic!("Failed to convert server public key");
+        },
+    };
+
+    // client deduces the two session keys rx1 and tx1
+    let (rx, tx) = match kx::client_session_keys(&client_pk, &client_sk, &server_pk) {
+        Ok((rx, tx)) => (rx, tx),
+        Err(()) => panic!("bad server signature"),
+    };
+
+    println!("Rx {:?}, Tx {:?}", rx, tx);
+
+    //println!("notified server of intent to hack planet.");    
 }
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
