@@ -4,10 +4,10 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::net::TcpListener;
 use sodiumoxide::crypto::kx;
+use sodiumoxide::crypto::aead;
 
 fn main () {
     sodiumoxide::init();
-
 
     // Wait on our client's arrival...
     println!("listening on 127.0.0.1:12345");
@@ -20,6 +20,7 @@ fn main () {
 
 fn handle_connection(mut connection: TcpStream) {
     let mut buffer = vec![0u8; 65535];
+    let n = aead::gen_nonce();
     let (server_pk, server_sk) = kx::gen_keypair();
 
     let client_pk = match recv(&mut connection) {
@@ -47,6 +48,19 @@ fn handle_connection(mut connection: TcpStream) {
     };
 
     println!("Rx {:?}, Tx {:?}", rx, tx);
+
+    let nonce = recv(&mut connection);
+    let m = b"Some plaintext";
+    let ad = b"Some additional data";
+    let tx = match aead::Key::from_slice(&tx.0) {
+        Some(v) => v,
+        None => {
+            panic!("Failed to convert to aead key");
+        }
+    };
+    let c = aead::seal(m, None, &n, &tx);
+
+    send(&mut connection, &c);
 
     println!("connection closed.");
 }

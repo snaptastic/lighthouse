@@ -3,6 +3,7 @@ extern crate sodiumoxide;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use sodiumoxide::crypto::kx;
+use sodiumoxide::crypto::aead;
 
 fn main() {
     let mut buffer = vec![0u8; 65535];
@@ -42,7 +43,18 @@ fn main() {
 
     println!("Rx {:?}, Tx {:?}", rx, tx);
 
-    //println!("notified server of intent to hack planet.");    
+    //println!("notified server of intent to hack planet.");
+    //let n = aead::gen_nonce();
+    let nonce = recv(&mut connection);
+    let rx = match aead::Key::from_slice(&rx.0) {
+        Some(v) => v,
+        None => {
+            panic!("Failed to convert to aead key");
+        }
+    };
+    let c = recv(&mut connection).unwrap();
+    let m2 = aead::open(&c, None, &n, &rx).unwrap();
+    println!("Message {:?}", m2);
 }
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
