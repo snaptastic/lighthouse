@@ -44,8 +44,15 @@ fn main() {
     println!("Rx {:?}, Tx {:?}", rx, tx);
 
     //println!("notified server of intent to hack planet.");
-    //let n = aead::gen_nonce();
-    let nonce = recv(&mut connection);
+    let nonce = recv(&mut connection).unwrap();
+    let nonce = match aead::Nonce::from_slice(&nonce){
+        Some(v) => v,
+        None => {
+            panic!("Failed to convert nonce");
+        }
+    };
+
+
     let rx = match aead::Key::from_slice(&rx.0) {
         Some(v) => v,
         None => {
@@ -53,8 +60,8 @@ fn main() {
         }
     };
     let c = recv(&mut connection).unwrap();
-    let m2 = aead::open(&c, None, &n, &rx).unwrap();
-    println!("Message {:?}", m2);
+    let m2 = aead::open(&c, None, &nonce, &rx).unwrap();
+    println!("Message: {}", String::from_utf8(m2).expect("Invalid utf-8"));
 }
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.

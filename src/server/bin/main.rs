@@ -49,7 +49,8 @@ fn handle_connection(mut connection: TcpStream) {
 
     println!("Rx {:?}, Tx {:?}", rx, tx);
 
-    let nonce = recv(&mut connection);
+    let nonce = aead::gen_nonce();
+    send(&mut connection, &nonce.0);
     let m = b"Some plaintext";
     let ad = b"Some additional data";
     let tx = match aead::Key::from_slice(&tx.0) {
@@ -58,7 +59,7 @@ fn handle_connection(mut connection: TcpStream) {
             panic!("Failed to convert to aead key");
         }
     };
-    let c = aead::seal(m, None, &n, &tx);
+    let c = aead::seal(m, None, &nonce, &tx);
 
     send(&mut connection, &c);
 
