@@ -1,28 +1,40 @@
 extern crate snow;
+extern crate lighthouse;
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::net::TcpListener;
 use snow::Builder;
+use lighthouse::ThreadPool;
 
-fn main() {   
-    let builder: Builder = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-    let static_key = builder.generate_keypair().unwrap();
-    let noise = builder
-        .local_private_key(&static_key.private)
-        .build_responder().unwrap();
+fn main() {
+    let pool = ThreadPool::new(4);
 
     // Wait on our client's arrival...
     println!("listening on 127.0.0.1:12345");
 
     let listener = TcpListener::bind("127.0.0.1:12345").unwrap();
-    let (connection, _) = listener.accept().unwrap();
-    println!("Connection Established!");
-    handle_connection(noise, connection);
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(v) => v,
+            Err(e) => panic!("Error accepting client: {:?}", e)
+        };
+
+        pool.execute(|| {
+            handle_connection(stream);
+        });
+    }
 }
 
-fn handle_connection(mut noise: snow::Session, mut connection: TcpStream) {
+fn handle_connection(mut connection: TcpStream) {
     let mut buffer = vec![0u8; 65535];
+
+    let builder: Builder = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+    let static_key = builder.generate_keypair().unwrap();
+    let mut noise = builder
+        .local_private_key(&static_key.private)
+        .build_responder().unwrap();
+
 
     // <- e
     noise.read_message(&recv(&mut connection).unwrap(), &mut buffer).unwrap();
