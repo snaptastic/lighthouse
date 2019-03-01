@@ -13,3 +13,5 @@ path = "src/client/bin/main.rs"
 
 [dependencies]
 sodiumoxide = "0.2.0"
+mio = "0.6"
+rustyline = "3.0.0"
