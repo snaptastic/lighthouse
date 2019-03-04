@@ -1,6 +1,8 @@
 extern crate sodiumoxide;
 extern crate mio;
 extern crate rustyline;
+extern crate serde;
+extern crate uuid;
 
 use std::io::{self, Read, Write, Error, ErrorKind};
 use std::collections::HashMap;
@@ -9,30 +11,59 @@ use std::time::{Duration};
 use std::{thread};
 use std::os::unix::io::AsRawFd;
 
-use sodiumoxide::crypto::kx;
-use sodiumoxide::crypto::aead;
-use sodiumoxide::crypto::aead::Key;
+use sodiumoxide::crypto::kx::*;
+use sodiumoxide::crypto::secretbox::*;
 
 use mio::{Events, Ready, Poll, PollOpt, Token};
 use mio::net::{TcpStream, TcpListener};
 use mio::unix::EventedFd;
 
 use rustyline::error::ReadlineError;
+use rustyline::config::Builder;
 use rustyline::Editor;
 
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 struct Client {
     token: mio::Token,
     connection: TcpStream,
-    keys: KeyMaterial,
+    remote_address: SocketAddr,
+    agent_uuid: uuid::Uuid,
+    keys: AgentConfiguration,
 }
 
-#[derive(Debug)]
-struct KeyMaterial {
+#[derive(Serialize, Deserialize, Debug)]
+struct AgentConfiguration {
     rx: Key,
     tx: Key,
-    nonce: aead::Nonce,
+    nonce: Nonce,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct KeyExchange {
+    client_public_key: PublicKey,
+    agent_uuid: uuid::Uuid,    
+}
+
+#[macro_export]
+macro_rules! some_or_continue {
+  ($option:expr) => {
+    match $option {
+      Some(value) => value,
+      None => continue,
+    }
+  }
+}
+
+#[macro_export]
+macro_rules! ok_or_continue {
+  ($result:expr) => {
+    match $result {
+      Ok(value) => value,
+      Err(_e) => continue /* do something with that error? */,
+    }
+  }
 }
 
 fn main () -> Result<(), Box<std::error::Error>> {
@@ -81,14 +112,18 @@ fn socket_event_loop(listener: TcpListener) -> Result<(), Box<std::error::Error>
     let stdin_fd = io::stdin().as_raw_fd();
     poll.register(&EventedFd(&stdin_fd),
              STDIN, Ready::readable(), PollOpt::edge())?;
-    //println!("{:?}", stdin);
+    print!("{} >> ", context);
+    io::stdout().flush().unwrap();
+
+    let rustyline_config_builder = Builder::new().max_history_size(1024).auto_add_history(true);
+    let rustyline_config = rustyline_config_builder.build();
+    let mut readline_editor = Editor::<>::with_config(rustyline_config);
 
     loop {
         // Wait for events
         poll.poll(&mut events, None)?;
 
         for event in &events {
-            //println!("{:?}", event);
             match event.token() {
                 LISTEN_TOKEN => {
                     // Perform operations in a loop until `WouldBlock` is
@@ -105,18 +140,23 @@ fn socket_event_loop(listener: TcpListener) -> Result<(), Box<std::error::Error>
                                             Ready::readable(),
                                             PollOpt::edge())?;
 
-                                let new_keys = match key_exchange(&socket) {
+                                let (new_keys, new_agent_uuid) = match key_exchange(&socket) {
                                     Ok(keys) => keys,
                                     Err(error) => {
                                         println!("{:?}", error);
                                         break
                                     },
                                 };
+
+                                let new_client_address = socket.try_clone().unwrap().peer_addr().unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0));
                                 let mut client = Client {
                                         token: new_client_token,
                                         connection: socket,
+                                        remote_address: new_client_address,
+                                        agent_uuid: new_agent_uuid,
                                         keys: new_keys
                                 };
+                                println!("New agent connected: {} - {}", client.remote_address, client.agent_uuid);
 
                                 // Store the socket
                                 sockets.insert(new_client_token, client);
@@ -131,7 +171,7 @@ fn socket_event_loop(listener: TcpListener) -> Result<(), Box<std::error::Error>
                     }
                 }
                 STDIN => {
-                    match input_loop(&sockets) {
+                    match input_loop(&sockets, &mut readline_editor) {
                         Ok(_) => (),
                         Err(error) => {
                             if error == "exit" {
@@ -149,13 +189,10 @@ fn socket_event_loop(listener: TcpListener) -> Result<(), Box<std::error::Error>
                         Ok(_) => continue,
                         Err(error) => match error.kind() {
                             io::ErrorKind::BrokenPipe => {
-                                /*
-                                let client_ipv4 = match sockets.get(&token){
-                                    Some(client) => client.connection.peer_addr().unwrap(),
-                                    None => SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
-                                };
-                                println!("Removing client {:?} and {:?}", client_ipv4, token);
-                                */
+                                {
+                                    let client = some_or_continue!(sockets.get(&token));
+                                    println!("Client disconnect: {} - {}", client.remote_address, client.agent_uuid);
+                                }
                                 sockets.remove(&token);
                             },
                             error => panic!("Error: {:?}", error),
@@ -167,18 +204,17 @@ fn socket_event_loop(listener: TcpListener) -> Result<(), Box<std::error::Error>
     }
 }
 
-fn input_loop(sockets: &HashMap<mio::Token, Client>) -> Result<(), &str> {
-    let mut rl = Editor::<()>::new();
+fn input_loop<'a>(sockets: &HashMap<mio::Token, Client>, readline_editor: &mut rustyline::Editor<()>) -> Result<(), &'a str> {
     let builtin_commands = vec![
         String::from("help"),
         String::from("hosts"),
+        String::from("disconnect"),
         String::from("quit"),
     ];
 
-    let readline = rl.readline("");
+    let readline = readline_editor.readline("");
     match readline {
         Ok(line) => {
-            rl.add_history_entry(line.as_ref());
             match &line[..] {
                 "help" => {
                     println!("Available commands: {}", builtin_commands.join(", "));
@@ -189,13 +225,26 @@ fn input_loop(sockets: &HashMap<mio::Token, Client>) -> Result<(), &str> {
                         return Ok(());
                     }
                     for (token, client) in sockets {
-                        println!("{}) {}", token.0, client.connection.peer_addr().unwrap());
+                        println!("{}) {} - {}", token.0, client.remote_address, client.agent_uuid);
                     }
                 },
+                line if line.starts_with("disconnect") => {
+                    let mut clients_to_disconnect: Vec<mio::Token> = Vec::with_capacity(1024);
+                    for client_token in line.trim_start_matches("disconnect").split_whitespace() {
+                        clients_to_disconnect.push(Token(ok_or_continue!(client_token.parse::<usize>())));
+                    }
+
+                    for client_token in clients_to_disconnect {
+                        let client = some_or_continue!(sockets.get(&client_token));
+                        ok_or_continue!(client.connection.shutdown(Shutdown::Both));
+                        println!("Disconnecting client {}: {}", client.token.0, client.remote_address);
+                    }
+
+                }
                 "quit" => {
                     for (_, client) in sockets {
-                        println!("Closing {}", client.connection.peer_addr().unwrap());
-                        client.connection.shutdown(Shutdown::Both).unwrap();
+                        println!("Closing {}", client.remote_address);
+                        ok_or_continue!(client.connection.shutdown(Shutdown::Both));
                     }
                     return Err("exit")
                 },
@@ -218,12 +267,6 @@ fn input_loop(sockets: &HashMap<mio::Token, Client>) -> Result<(), &str> {
     Ok(())
 }
 
-/*
-fn accept_client() {
-
-}
-*/
-
 fn match_client(sockets: &HashMap<Token, Client>, token: mio::Token) -> Result<(), io::Error> {
     let custom_error = Error::new(ErrorKind::BrokenPipe, "Client disconnect");
     match sockets.get(&token).unwrap() {
@@ -245,7 +288,7 @@ fn match_client(sockets: &HashMap<Token, Client>, token: mio::Token) -> Result<(
                     error => panic!("Error: {:?}", error), 
                 },
             };
-            //let m2 = aead::open(&c, None, &client.keys.nonce, &client.keys.rx).unwrap();
+            //let m2 = open(&c, &client.keys.nonce, &client.keys.rx).unwrap();
             //println!("Message: {}", String::from_utf8(m2).expect("Invalid utf-8"));
         },
     }
@@ -253,18 +296,18 @@ fn match_client(sockets: &HashMap<Token, Client>, token: mio::Token) -> Result<(
     Ok(())
 }
 
-fn key_exchange(connection: &TcpStream) -> Result<KeyMaterial, io::Error> {
-    let nonce = aead::gen_nonce();
+fn key_exchange(connection: &TcpStream) -> Result<(AgentConfiguration, uuid::Uuid), Error> {
+    let nonce = gen_nonce();
     let custom_error = Error::new(ErrorKind::BrokenPipe, "Client disconnect");
-    let (server_pk, server_sk) = kx::gen_keypair();
+    let (server_public_key, server_private_key) = gen_keypair();
     #[allow(unused_assignments)]
-    let mut client_pk = vec![0u8; 65535];
+    let mut client_public_key = vec![0u8; 65535];
     let five_seconds = Duration::new(5, 0);
 
     loop {
-        client_pk = match recv(&connection) {
-            Ok(client_pk) => {
-                client_pk
+        client_public_key = match recv(&connection) {
+            Ok(client_public_key) => {
+                client_public_key
             },
             Err(error) => match error.kind() {
                 io::ErrorKind::WouldBlock => {
@@ -284,31 +327,23 @@ fn key_exchange(connection: &TcpStream) -> Result<KeyMaterial, io::Error> {
         break;
     }
 
-    let client_pk = match sodiumoxide::crypto::kx::x25519blake2b::PublicKey::from_slice(&client_pk) {
-        Some(v) => v,
-        None => {
-            panic!("Failed to convert client public key");
-        },
-    };
-    println!("Received client public key: {:?}", client_pk);
-
-    println!("Sending server public key: {:?}", server_pk.0);
-    send(&connection, &server_pk.0)?;
+    let client_initial_info: KeyExchange = serde_json::from_slice(&client_public_key)?;
+    send(&connection, &server_public_key.0)?;
 
     // server performs the same operation
-    let (rx, tx) = match kx::server_session_keys(&server_pk, &server_sk, &client_pk) {
+    let (rx, tx) = match server_session_keys(&server_public_key, &server_private_key, &client_initial_info.client_public_key) {
         Ok((rx, tx)) => (rx, tx),
         Err(()) => panic!("bad client signature"),
     };
 
-    let key1 = match aead::Key::from_slice(&tx.0) {
+    let key1 = match Key::from_slice(&tx.0) {
         Some(v) => v,
         None => {
             panic!("Failed to convert to aead key");
         }
     };
 
-    let key2 = match aead::Key::from_slice(&rx.0) {
+    let key2: Key = match Key::from_slice(&rx.0) {
         Some(v) => v,
         None => {
             panic!("Failed to convert to aead key");
@@ -317,11 +352,11 @@ fn key_exchange(connection: &TcpStream) -> Result<KeyMaterial, io::Error> {
 
     send(&connection, &nonce.0)?;
 
-    Ok(KeyMaterial {
+    Ok((AgentConfiguration {
         tx: key1,
         rx: key2,
         nonce: nonce,
-    })
+    }, client_initial_info.agent_uuid))
 }
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
